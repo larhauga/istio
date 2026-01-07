@@ -968,6 +968,8 @@ func getPrometheusScrapeConfiguration(pod *corev1.Pod) status.PrometheusScrapeCo
 			cfg.Scrape = val
 		case prometheusPathAnnotation:
 			cfg.Path = val
+		case annotation.SidecarStatsCompression.Name:
+			cfg.Compression = val
 		}
 	}
 

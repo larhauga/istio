@@ -15,6 +15,7 @@
 package status
 
 import (
+	"compress/gzip"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -504,9 +505,54 @@ func (s *Server) isReady() error {
 }
 
 type PrometheusScrapeConfiguration struct {
-	Scrape string `json:"scrape"`
-	Path   string `json:"path"`
-	Port   string `json:"port"`
+	Scrape      string `json:"scrape"`
+	Path        string `json:"path"`
+	Port        string `json:"port"`
+	Compression string `json:"compression,omitempty"`
+}
+
+// gzipWriterPool is a pool of gzip writers to reduce allocations.
+// Reusing gzip writers can significantly improve performance when compression is enabled.
+var gzipWriterPool = sync.Pool{
+	New: func() any {
+		// Use BestSpeed (level 1) for better performance.
+		// Metrics compress well even at this level, and it's much faster than DefaultCompression (level 6).
+		w, _ := gzip.NewWriterLevel(io.Discard, gzip.BestSpeed)
+		return w
+	},
+}
+
+// gzipResponseWriter wraps http.ResponseWriter to provide transparent gzip compression.
+type gzipResponseWriter struct {
+	http.ResponseWriter
+	Writer *gzip.Writer
+}
+
+func (w *gzipResponseWriter) Write(b []byte) (int, error) {
+	return w.Writer.Write(b)
+}
+
+// Flush implements http.Flusher interface
+func (w *gzipResponseWriter) Flush() {
+	w.Writer.Flush()
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// shouldCompressStats determines if the response should be gzip compressed.
+// Compression is enabled only when:
+// 1. The client accepts gzip encoding (via Accept-Encoding header)
+// 2. The statsCompression annotation is set to "gzip"
+func shouldCompressStats(promConfig *PrometheusScrapeConfiguration, r *http.Request) bool {
+	// Check if compression is configured
+	if promConfig == nil || promConfig.Compression != "gzip" {
+		return false
+	}
+
+	// Check if client accepts gzip
+	acceptEncoding := r.Header.Get("Accept-Encoding")
+	return strings.Contains(acceptEncoding, "gzip")
 }
 
 // handleStats handles prometheus stats scraping. This will scrape envoy metrics, and, if configured,
@@ -575,14 +621,38 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", string(format))
 
+	// Determine if we should compress the response
+	// Prometheus currently only supports gzip compression
+	var writer io.Writer = w
+	if shouldCompressStats(s.prometheus, r) {
+		// Set Vary header to inform caches that response varies based on Accept-Encoding.
+		w.Header().Set("Vary", "Accept-Encoding")
+		w.Header().Set("Content-Encoding", "gzip")
+
+		// Get a gzip writer from the pool for better performance
+		gz := gzipWriterPool.Get().(*gzip.Writer)
+		gz.Reset(w)
+		defer func() {
+			if err := gz.Close(); err != nil {
+				log.Errorf("failed closing gzip write when scraping and writing metrics: %v", err)
+			}
+			gz.Reset(io.Discard) // Reset before returning to pool
+			gzipWriterPool.Put(gz)
+		}()
+		writer = &gzipResponseWriter{
+			ResponseWriter: w,
+			Writer:         gz,
+		}
+	}
+
 	// Write out the metrics
-	if err = scrapeAndWriteAgentMetrics(s.registry, io.Writer(w)); err != nil {
+	if err = scrapeAndWriteAgentMetrics(s.registry, writer); err != nil {
 		log.Errorf("failed scraping and writing agent metrics: %v", err)
 		metrics.AgentScrapeErrors.Increment()
 	}
 
 	if envoy != nil {
-		_, err = io.Copy(w, envoy)
+		_, err = io.Copy(writer, envoy)
 		if err != nil {
 			log.Errorf("failed to scraping and writing envoy metrics: %v", err)
 			metrics.EnvoyScrapeErrors.Increment()
@@ -592,7 +662,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	// App metrics must go last because if they are FmtOpenMetrics,
 	// they will have a trailing "# EOF" which terminates the full exposition
 	if application != nil {
-		_, err = io.Copy(w, application)
+		_, err = io.Copy(writer, application)
 		if err != nil {
 			log.Errorf("failed to scraping and writing application metrics: %v", err)
 			metrics.AppScrapeErrors.Increment()

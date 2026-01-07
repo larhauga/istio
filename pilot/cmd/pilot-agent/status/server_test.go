@@ -15,6 +15,7 @@
 package status
 
 import (
+	"compress/gzip"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -433,6 +434,77 @@ func TestNegotiateMetricsFormat(t *testing.T) {
 	}
 }
 
+func TestShouldCompressStats(t *testing.T) {
+	tests := []struct {
+		name           string
+		promConfig     *PrometheusScrapeConfiguration
+		acceptEncoding string
+		expected       bool
+	}{
+		{
+			name:           "compression enabled with gzip accept",
+			promConfig:     &PrometheusScrapeConfiguration{Compression: "gzip"},
+			acceptEncoding: "gzip",
+			expected:       true,
+		},
+		{
+			name:           "compression enabled without gzip accept",
+			promConfig:     &PrometheusScrapeConfiguration{Compression: "gzip"},
+			acceptEncoding: "",
+			expected:       false,
+		},
+		{
+			name:           "compression enabled with deflate accept",
+			promConfig:     &PrometheusScrapeConfiguration{Compression: "gzip"},
+			acceptEncoding: "deflate",
+			expected:       false,
+		},
+		{
+			name:           "compression enabled with multiple accepts including gzip",
+			promConfig:     &PrometheusScrapeConfiguration{Compression: "gzip"},
+			acceptEncoding: "deflate, gzip, br",
+			expected:       true,
+		},
+		{
+			name:           "no compression config",
+			promConfig:     &PrometheusScrapeConfiguration{},
+			acceptEncoding: "gzip",
+			expected:       false,
+		},
+		{
+			name:           "nil config",
+			promConfig:     nil,
+			acceptEncoding: "gzip",
+			expected:       false,
+		},
+		{
+			name:           "brotli compression config",
+			promConfig:     &PrometheusScrapeConfiguration{Compression: "brotli"},
+			acceptEncoding: "gzip",
+			expected:       false,
+		},
+		{
+			name:           "zstd compression config",
+			promConfig:     &PrometheusScrapeConfiguration{Compression: "zstd"},
+			acceptEncoding: "gzip",
+			expected:       false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := &http.Request{Header: make(http.Header)}
+			if tt.acceptEncoding != "" {
+				req.Header.Set("Accept-Encoding", tt.acceptEncoding)
+			}
+			result := shouldCompressStats(tt.promConfig, req)
+			if result != tt.expected {
+				t.Errorf("shouldCompressStats() = %v; want %v", result, tt.expected)
+			}
+		})
+	}
+}
+
 func TestStatsContentType(t *testing.T) {
 	appOpenMetrics := `# TYPE jvm info
 # HELP jvm VM version info
@@ -677,6 +749,143 @@ func BenchmarkStats(t *testing.B) {
 				req.Header.Add("Accept", string(FmtOpenMetrics_1_0_0))
 				rec := httptest.NewRecorder()
 				server.handleStats(rec, req)
+			}
+		})
+	}
+}
+
+func TestStatsCompression(t *testing.T) {
+	envoyMetrics := "envoy_metric 1"
+	appMetrics := "app_metric 1"
+
+	tests := []struct {
+		name              string
+		compression       string
+		acceptEncoding    string
+		expectCompression bool
+	}{
+		{
+			name:              "gzip compression enabled with gzip accept encoding",
+			compression:       "gzip",
+			acceptEncoding:    "gzip",
+			expectCompression: true,
+		},
+		{
+			name:              "gzip compression enabled without gzip accept encoding",
+			compression:       "gzip",
+			acceptEncoding:    "",
+			expectCompression: false,
+		},
+		{
+			name:              "no compression annotation",
+			compression:       "",
+			acceptEncoding:    "gzip",
+			expectCompression: false,
+		},
+		{
+			name:              "non-gzip compression type",
+			compression:       "brotli",
+			acceptEncoding:    "gzip",
+			expectCompression: false,
+		},
+		{
+			name:              "gzip in accept encoding list",
+			compression:       "gzip",
+			acceptEncoding:    "deflate, gzip, br",
+			expectCompression: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			envoy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if _, err := w.Write([]byte(envoyMetrics)); err != nil {
+					t.Fatalf("write failed: %v", err)
+				}
+			}))
+			defer envoy.Close()
+			app := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if _, err := w.Write([]byte(appMetrics)); err != nil {
+					t.Fatalf("write failed: %v", err)
+				}
+			}))
+			defer app.Close()
+			envoyPort, err := strconv.Atoi(strings.Split(envoy.URL, ":")[2])
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			promConfig := &PrometheusScrapeConfiguration{
+				Port: strings.Split(app.URL, ":")[2],
+			}
+			if tt.compression != "" {
+				promConfig.Compression = tt.compression
+			}
+
+			server := &Server{
+				prometheus:     promConfig,
+				envoyStatsPort: envoyPort,
+				http:           &http.Client{},
+				registry:       TestingRegistry(t),
+			}
+
+			req := &http.Request{Header: make(http.Header)}
+			if tt.acceptEncoding != "" {
+				req.Header.Set("Accept-Encoding", tt.acceptEncoding)
+			}
+
+			server.handleStats(rec, req)
+
+			if rec.Code != 200 {
+				t.Fatalf("handleStats() => %v; want 200", rec.Code)
+			}
+
+			// Check if response is compressed
+			contentEncoding := rec.Header().Get("Content-Encoding")
+			varyHeader := rec.Header().Get("Vary")
+
+			if tt.expectCompression {
+				if contentEncoding != "gzip" {
+					t.Fatalf("expected Content-Encoding: gzip, got: %s", contentEncoding)
+				}
+				// Verify Vary header is set for proper HTTP caching
+				if varyHeader != "Accept-Encoding" {
+					t.Fatalf("expected Vary: Accept-Encoding, got: %s", varyHeader)
+				}
+				// Decompress and verify content
+				reader, err := gzip.NewReader(rec.Body)
+				if err != nil {
+					t.Fatalf("failed to create gzip reader: %v", err)
+				}
+				defer reader.Close()
+				body, err := io.ReadAll(reader)
+				if err != nil {
+					t.Fatalf("failed to read gzip body: %v", err)
+				}
+				bodyStr := string(body)
+				if !strings.Contains(bodyStr, envoyMetrics) {
+					t.Fatalf("expected envoy metrics in compressed response, got: %s", bodyStr)
+				}
+				if !strings.Contains(bodyStr, appMetrics) {
+					t.Fatalf("expected app metrics in compressed response, got: %s", bodyStr)
+				}
+			} else {
+				if contentEncoding == "gzip" {
+					t.Fatalf("unexpected Content-Encoding: gzip")
+				}
+				// Vary header should not be set when compression is disabled
+				if varyHeader == "Accept-Encoding" {
+					t.Fatalf("unexpected Vary header when compression is disabled")
+				}
+				// Verify uncompressed content
+				bodyStr := rec.Body.String()
+				if !strings.Contains(bodyStr, envoyMetrics) {
+					t.Fatalf("expected envoy metrics in uncompressed response, got: %s", bodyStr)
+				}
+				if !strings.Contains(bodyStr, appMetrics) {
+					t.Fatalf("expected app metrics in uncompressed response, got: %s", bodyStr)
+				}
 			}
 		})
 	}
